@@ -97,7 +97,6 @@ class Advantage_Actor_Critic():
         # next_state_batch = Variable(torch.FloatTensor(batch.next_state).view(-1,nb_state))
         # reward_batch = Variable(torch.FloatTensor(batch.reward).view(-1,1))
 
-        ################# Advantage ################
         #---------------update critic---------------------
         v_eval = self.critic(state_batch)
         q_target = Variable(torch.FloatTensor(self.discount_reward(batch.reward,0.99,1))).unsqueeze(1)
