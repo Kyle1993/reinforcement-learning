@@ -2,6 +2,7 @@ import gym
 import numpy as np
 from itertools import count
 from collections import namedtuple
+import random
 
 import torch
 import torch.nn as nn
@@ -10,30 +11,61 @@ from torch.autograd import Variable
 
 
 gamma = 0.99
-actor_lr = 1e-2
-critic_lr = 1e-2
-max_step = 10000
+actor_lr = 1e-4
+critic_lr = 1e-3
+max_step = 200
+batch_size = 128
 
 print_interval = 10
 test_num = 3
 
 RENDER = False
-render_num = 200
+render_num = 2000
 
-Memory_unit = namedtuple('Memory_unit', ['state','actions_prob','action','next_state', 'reward'])
+
+def fanin_init(size, fanin=None):
+    fanin = fanin or size[0]
+    v = 1. / np.sqrt(fanin)
+    return torch.Tensor(size).uniform_(-v, v)
+
+class Memory():
+    def __init__(self,max_len,batch_size):
+        self.max_len = max_len
+        self.current_index = -1
+        self.counter = 0
+        self.memory = [None for _ in range(self.max_len)]
+        self.batch_size = batch_size
+
+    def append(self, state, action_prob, action, next_state, reward, done):
+        self.current_index = (self.current_index + 1) % self.max_len
+        self.memory[self.current_index] = (state, action_prob, action, next_state, reward, done)
+        self.counter += 1
+
+    def sample(self):
+        batch = random.sample(self.memory[:min(self.counter, self.max_len)], self.batch_size)
+        batch = list(zip(*batch))
+
+        state_batch = np.asarray(batch[0], dtype=np.float32)  # batch * myself_num * enemy_num+1 * state_size
+        actionprob_batch = np.asarray(batch[1], dtype=np.float32)
+        action_batch = np.asarray(batch[2],dtype=np.int)
+        next_state_batch = np.asarray(batch[3], dtype=np.float32)
+        reward_batch = np.asarray(batch[4], dtype=np.float32)
+        done_batch = np.asarray(batch[5], dtype=np.int32)
+
+        return state_batch, actionprob_batch, action_batch, next_state_batch, reward_batch, done_batch
 
 class Actor(nn.Module):
 
-    def __init__(self,state_szie,action_size,hidden_size=40,init_w=3e-3):
+    def __init__(self,state_szie,action_size,hidden_size=40,init_w=3e-2):
         super(Actor, self).__init__()
         self.fc1 = nn.Linear(state_szie,hidden_size)
         self.fc2 = nn.Linear(hidden_size,hidden_size)
         self.fc3 = nn.Linear(hidden_size,action_size)
-        self.init_weight(init_w)
+        # self.init_weight(init_w)
 
     def forward(self,s):
-        out = F.relu(self.fc1(s))
-        out = F.relu(self.fc2(out))
+        out = F.tanh(self.fc1(s))
+        out = F.tanh(self.fc2(out))
         out = F.softmax(self.fc3(out))
         return out
 
@@ -44,13 +76,13 @@ class Actor(nn.Module):
 
 class Critic(nn.Module):
 
-    def __init__(self,input_size,action_size,hidden_size=40,output_size=1,init_w=3e-3):
+    def __init__(self,input_size,action_size,hidden_size=40,output_size=1,init_w=3e-2):
         super(Critic, self).__init__()
         self.fc1 = nn.Linear(input_size,hidden_size)
         self.fc2 = nn.Linear(action_size,hidden_size)
         self.fc3 = nn.Linear(2*hidden_size,hidden_size)
         self.fc4 = nn.Linear(hidden_size,output_size)
-        self.init_weight(init_w)
+        # self.init_weight(init_w)
 
     def forward(self,s,a):
         s = F.relu(self.fc1(s))
@@ -67,8 +99,9 @@ class Critic(nn.Module):
         self.fc4.weight.data.uniform_(-init_w, init_w)
 
 class Actor_Critic():
-    def __init__(self,nb_state,nb_action,critic_lr,actor_lr,init_w=3e-3):
-        self.memory = []
+    def __init__(self,nb_state,nb_action,gamma,critic_lr,actor_lr,init_w=3e-3):
+        self.memory = Memory(int(1e5),128)
+        self.gamma = gamma
         self.critic = Critic(nb_state,nb_action,init_w=init_w)
         self.optimizer_critic = torch.optim.Adam(self.critic.parameters(),lr=critic_lr)
 
@@ -83,29 +116,23 @@ class Actor_Critic():
             return torch.max(probs,1,keepdim=True)[1].data[0,0]
         return probs
 
-    def discount_reward(self,r, gamma,final_r):
-        discounted_r = np.zeros_like(r)
-        running_add = final_r
-        for t in reversed(range(0, len(r))):
-            running_add = running_add * gamma + r[t]
-            discounted_r[t] = running_add
-        return discounted_r
+    def train(self):
+        if self.memory.counter<3*batch_size:
+            return
+        state_batch,actionprob_batch,action_batch,next_state_batch,reward_batch,done_batch = self.memory.sample()
 
-
-    def train_episode(self):
-
-        batch = Memory_unit(*zip(*self.memory))
-
-        state_batch = Variable(torch.Tensor(batch.state).view(-1,nb_state))
-        actions_prob_batch = Variable(torch.FloatTensor(batch.actions_prob).view(-1,nb_aciton))
-        action_batch = Variable(torch.LongTensor(batch.action).view(-1,1))
-        # next_state_batch = Variable(torch.FloatTensor(batch.next_state).view(-1,nb_state))
-        # reward_batch = Variable(torch.FloatTensor(batch.reward).view(-1,1))
+        state_batch = Variable(torch.from_numpy(state_batch).view(-1,nb_state)).float()
+        actions_prob_batch = Variable(torch.from_numpy(actionprob_batch).view(-1,nb_aciton)).float()
+        action_batch = Variable(torch.from_numpy(action_batch).view(-1,1))
+        next_state_batch = Variable(torch.from_numpy(next_state_batch).view(-1,nb_state)).float()
+        reward_batch = Variable(torch.from_numpy(reward_batch).view(-1,1)).float()
+        done_batch = Variable(torch.from_numpy(done_batch).view(-1,1)).float()
 
         ########## TD_error ##########
         #---------------update critic---------------------
         q_eval = self.critic(state_batch,actions_prob_batch)
-        q_target = Variable(torch.FloatTensor(self.discount_reward(batch.reward,0.99,1))).unsqueeze(1)
+        q_next = self.critic(next_state_batch,self.actor(next_state_batch))
+        q_target = reward_batch+self.gamma*done_batch*q_next
 
         value_loss = torch.nn.functional.mse_loss(q_eval,q_target)
         self.optimizer_critic.zero_grad()
@@ -116,15 +143,15 @@ class Actor_Critic():
         #----------------update actor----------------------
         self.optimizer_actor.zero_grad()
         log_softmax_actions = torch.log(self.actor(state_batch))
-        q_eval = self.critic(state_batch,actions_prob_batch)
-        q_target = Variable(torch.FloatTensor(self.discount_reward(batch.reward,0.99,1))).unsqueeze(1)
+        q_eval = self.critic(state_batch,actions_prob_batch).detach()
+        q_next = self.critic(next_state_batch, self.actor(next_state_batch)).detach()
+        q_target = reward_batch + self.gamma * done_batch * q_next
         TD_error = q_target - q_eval
         policy_loss = - torch.mean(log_softmax_actions.gather(1,action_batch)* TD_error)
         policy_loss.backward()
         torch.nn.utils.clip_grad_norm(self.actor.parameters(),0.8)
         self.optimizer_actor.step()
 
-        self.memory = []
 
 # only chose the action with max prob
 def test(env,agent,episode):
@@ -146,35 +173,31 @@ def test(env,agent,episode):
                                                                   total_reward / test_num))
 
 
-def fanin_init(size, fanin=None):
-    fanin = fanin or size[0]
-    v = 1. / np.sqrt(fanin)
-    return torch.Tensor(size).uniform_(-v, v)
-
-
 env = gym.make('CartPole-v0')
 
 nb_aciton = env.action_space.n
 nb_state = env.observation_space.shape[0]
 
-actor_critic = Actor_Critic(nb_state,nb_aciton,critic_lr,actor_lr)
+actor_critic = Actor_Critic(nb_state,nb_aciton,gamma,critic_lr,actor_lr)
 
 for i_episode in count(1):
     state = env.reset()
     if i_episode > render_num:
         RENDER = True
     for t in range(max_step):
+        # print('----------------------')
         actions_prob = actor_critic.select_action(state)
+        # print(actions_prob)
         action = actions_prob.multinomial(1).data[0,0]
         next_state, reward, done, _ = env.step(action)
 
-        actor_critic.memory.append(Memory_unit(state,actions_prob[0].data.numpy().tolist(),action,next_state,reward))
+        actor_critic.memory.append(state,actions_prob[0].data.numpy(),action,next_state,reward,float(not done))
+        actor_critic.train()
 
         if done:
             break
         state = next_state
 
-    actor_critic.train_episode()
     if i_episode%print_interval == 0:
         test(env,actor_critic,i_episode)
 
