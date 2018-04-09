@@ -129,6 +129,7 @@ class Actor_Critic():
         v_eval = self.critic(state_batch)
         v_next = self.critic(next_state_batch)
         v_target = reward_batch+self.gamma*done_batch*v_next
+        v_target.detach_()
         td_error = (v_target-v_eval).detach()
 
         value_loss = torch.nn.functional.mse_loss(v_eval,v_target)
