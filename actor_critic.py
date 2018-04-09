@@ -11,8 +11,8 @@ from torch.autograd import Variable
 
 
 gamma = 0.99
-actor_lr = 1e-4
-critic_lr = 1e-3
+actor_lr = 1e-5
+critic_lr = 1e-4
 max_step = 200
 batch_size = 128
 
@@ -20,7 +20,7 @@ print_interval = 10
 test_num = 3
 
 RENDER = False
-render_num = 2000
+render_num = 2500
 
 
 def fanin_init(size, fanin=None):
@@ -64,9 +64,9 @@ class Actor(nn.Module):
         # self.init_weight(init_w)
 
     def forward(self,s):
-        out = F.tanh(self.fc1(s))
-        out = F.tanh(self.fc2(out))
-        out = F.softmax(self.fc3(out))
+        out = F.relu(self.fc1(s))
+        out = F.relu(self.fc2(out))
+        out = F.softmax(self.fc3(out),dim=1)
         return out
 
     def init_weight(self,init_w):
@@ -76,33 +76,29 @@ class Actor(nn.Module):
 
 class Critic(nn.Module):
 
-    def __init__(self,input_size,action_size,hidden_size=40,output_size=1,init_w=3e-2):
+    def __init__(self,input_size,hidden_size=40,output_size=1,init_w=3e-2):
         super(Critic, self).__init__()
-        self.fc1 = nn.Linear(input_size,hidden_size)
-        self.fc2 = nn.Linear(action_size,hidden_size)
-        self.fc3 = nn.Linear(2*hidden_size,hidden_size)
-        self.fc4 = nn.Linear(hidden_size,output_size)
+        self.fc1 = nn.Linear(input_size,4*hidden_size)
+        self.fc2 = nn.Linear(4*hidden_size,hidden_size)
+        self.fc3 = nn.Linear(hidden_size,1)
         # self.init_weight(init_w)
 
-    def forward(self,s,a):
-        s = F.relu(self.fc1(s))
-        a = F.relu(self.fc2(a))
-        out = torch.cat([s,a],1)
-        out = F.relu(self.fc3(out))
-        out = self.fc4(out)
+    def forward(self,s):
+        out = F.relu(self.fc1(s))
+        out = F.relu(self.fc2(out))
+        out = self.fc3(out)
         return out
 
     def init_weight(self,init_w):
         self.fc1.weight.data = fanin_init(self.fc1.weight.data.size())
         self.fc2.weight.data = fanin_init(self.fc2.weight.data.size())
-        self.fc3.weight.data = fanin_init(self.fc3.weight.data.size())
-        self.fc4.weight.data.uniform_(-init_w, init_w)
+        self.fc3.weight.data.uniform_(-init_w, init_w)
 
 class Actor_Critic():
     def __init__(self,nb_state,nb_action,gamma,critic_lr,actor_lr,init_w=3e-3):
         self.memory = Memory(int(1e5),128)
         self.gamma = gamma
-        self.critic = Critic(nb_state,nb_action,init_w=init_w)
+        self.critic = Critic(nb_state,init_w=init_w)
         self.optimizer_critic = torch.optim.Adam(self.critic.parameters(),lr=critic_lr)
 
         self.actor = Actor(nb_state,nb_action,init_w=init_w)
@@ -130,11 +126,12 @@ class Actor_Critic():
 
         ########## TD_error ##########
         #---------------update critic---------------------
-        q_eval = self.critic(state_batch,actions_prob_batch)
-        q_next = self.critic(next_state_batch,self.actor(next_state_batch))
-        q_target = reward_batch+self.gamma*done_batch*q_next
+        v_eval = self.critic(state_batch)
+        v_next = self.critic(next_state_batch)
+        v_target = reward_batch+self.gamma*done_batch*v_next
+        td_error = (v_target-v_eval).detach()
 
-        value_loss = torch.nn.functional.mse_loss(q_eval,q_target)
+        value_loss = torch.nn.functional.mse_loss(v_eval,v_target)
         self.optimizer_critic.zero_grad()
         value_loss.backward()
         torch.nn.utils.clip_grad_norm(self.critic.parameters(),0.8)
@@ -143,11 +140,7 @@ class Actor_Critic():
         #----------------update actor----------------------
         self.optimizer_actor.zero_grad()
         log_softmax_actions = torch.log(self.actor(state_batch))
-        q_eval = self.critic(state_batch,actions_prob_batch).detach()
-        q_next = self.critic(next_state_batch, self.actor(next_state_batch)).detach()
-        q_target = reward_batch + self.gamma * done_batch * q_next
-        TD_error = q_target - q_eval
-        policy_loss = - torch.mean(log_softmax_actions.gather(1,action_batch)* TD_error)
+        policy_loss = - torch.mean(log_softmax_actions.gather(1,action_batch)* td_error)
         policy_loss.backward()
         torch.nn.utils.clip_grad_norm(self.actor.parameters(),0.8)
         self.optimizer_actor.step()
@@ -187,13 +180,14 @@ for i_episode in count(1):
     for t in range(max_step):
         # print('----------------------')
         actions_prob = actor_critic.select_action(state)
-        # print(actions_prob)
         action = actions_prob.multinomial(1).data[0,0]
         next_state, reward, done, _ = env.step(action)
 
         actor_critic.memory.append(state,actions_prob[0].data.numpy(),action,next_state,reward,float(not done))
         actor_critic.train()
-
+        # during the train, the parameter always be NaN, I can't fix it
+        if np.isnan(np.sum(list(actor_critic.actor.fc1.parameters())[0].data.numpy())):
+            print('NAN')
         if done:
             break
         state = next_state
