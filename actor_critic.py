@@ -125,13 +125,13 @@ class Actor_Critic():
         done_batch = Variable(torch.from_numpy(done_batch).view(-1,1)).float()
 
         ########## TD_error ##########
-        #---------------update critic---------------------
         v_eval = self.critic(state_batch)
         v_next = self.critic(next_state_batch)
         v_target = reward_batch+self.gamma*done_batch*v_next
         v_target.detach_()
         td_error = (v_target-v_eval).detach()
 
+        #---------------update critic---------------------
         value_loss = torch.nn.functional.mse_loss(v_eval,v_target)
         self.optimizer_critic.zero_grad()
         value_loss.backward()
